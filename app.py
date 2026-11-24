@@ -1,4 +1,3 @@
-import sqlite3
 import math
 import hashlib
 import hmac
@@ -7,11 +6,13 @@ from datetime import date
 
 import pandas as pd
 import plotly.express as px
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import streamlit as st
 
-DB_NAME = "warung_bu_dian.db"
 APP_NAME = "SI-PRO IKM"
 APP_SUBTITLE = "Sistem Pendukung Keputusan Produksi"
+
 
 
 # =========================================================
@@ -25,69 +26,100 @@ st.set_page_config(
 )
 
 
+try:
+    DATABASE_URL = st.secrets["DATABASE_URL"]
+except Exception:
+    DATABASE_URL = ""
+
+if not DATABASE_URL:
+    st.error(
+        "DATABASE_URL belum dikonfigurasi. Tambahkan connection string "
+        "Supabase pada Settings > Secrets di Streamlit Community Cloud."
+    )
+    st.stop()
+
+
 # =========================================================
-# DATABASE
+# DATABASE POSTGRESQL (SUPABASE)
 # =========================================================
+class DatabaseConnection:
+    """Wrapper koneksi PostgreSQL dengan cursor berbentuk dictionary."""
+
+    def __init__(self):
+        self.connection = psycopg2.connect(
+            DATABASE_URL,
+            sslmode="require",
+            connect_timeout=15,
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+
+    def execute(self, query, params=None):
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(query, params or ())
+        return cursor
+
+    def commit(self):
+        self.connection.commit()
+
+
 def get_connection():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DatabaseConnection()
 
 
 def table_exists(conn, table_name):
     result = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = %s
+        """,
         (table_name,),
     ).fetchone()
     return result is not None
 
 
 def init_db():
-    """Membuat tabel baru dan mempertahankan tabel lama untuk proses migrasi."""
+    """Membuat tabel PostgreSQL untuk akun dan data harian."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                id BIGSERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 owner_name TEXT NOT NULL,
                 business_name TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # Jika database lama memiliki data_harian tanpa user_id,
-        # tabel lama diganti nama agar datanya tetap tersimpan.
-        if table_exists(conn, "data_harian"):
-            columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(data_harian)").fetchall()
-            }
-            if "user_id" not in columns:
-                if not table_exists(conn, "data_harian_legacy"):
-                    conn.execute(
-                        "ALTER TABLE data_harian RENAME TO data_harian_legacy"
-                    )
-                else:
-                    # Jika tabel legacy sudah ada, jangan menimpa data lama.
-                    conn.execute("DROP TABLE data_harian")
-
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx
+            ON users (LOWER(username))
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS data_harian (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                tanggal TEXT NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                tanggal DATE NOT NULL,
                 produksi INTEGER NOT NULL,
                 penjualan INTEGER NOT NULL,
                 sisa_ayam INTEGER NOT NULL,
-                harga_jual REAL NOT NULL,
-                biaya_produksi REAL NOT NULL,
-                dibuat_pada TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, tanggal),
-                FOREIGN KEY(user_id) REFERENCES users(id)
+                harga_jual DOUBLE PRECISION NOT NULL,
+                biaya_produksi DOUBLE PRECISION NOT NULL,
+                dibuat_pada TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, tanggal)
             )
         """)
-        conn.commit()
 
 
 # =========================================================
@@ -117,7 +149,7 @@ def create_user(username, password, owner_name, business_name):
         conn.execute(
             """
             INSERT INTO users (username, password_hash, owner_name, business_name)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
             """,
             (
                 username.strip(),
@@ -132,7 +164,7 @@ def create_user(username, password, owner_name, business_name):
 def authenticate_user(username, password):
     with get_connection() as conn:
         user = conn.execute(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)",
             (username.strip(),),
         ).fetchone()
 
@@ -144,7 +176,7 @@ def authenticate_user(username, password):
 def get_user(user_id):
     with get_connection() as conn:
         user = conn.execute(
-            "SELECT id, username, owner_name, business_name FROM users WHERE id=?",
+            "SELECT id, username, owner_name, business_name FROM users WHERE id=%s",
             (user_id,),
         ).fetchone()
     return dict(user) if user else None
@@ -153,7 +185,7 @@ def get_user(user_id):
 def update_user_profile(user_id, owner_name, business_name):
     with get_connection() as conn:
         conn.execute(
-            "UPDATE users SET owner_name=?, business_name=? WHERE id=?",
+            "UPDATE users SET owner_name=%s, business_name=%s WHERE id=%s",
             (owner_name.strip(), business_name.strip(), user_id),
         )
         conn.commit()
@@ -164,23 +196,22 @@ def update_user_profile(user_id, owner_name, business_name):
 # =========================================================
 def load_data(user_id):
     with get_connection() as conn:
-        df = pd.read_sql_query(
+        rows = conn.execute(
             """
             SELECT * FROM data_harian
-            WHERE user_id = ?
+            WHERE user_id = %s
             ORDER BY tanggal ASC
             """,
-            conn,
-            params=(user_id,),
-        )
+            (user_id,),
+        ).fetchall()
 
+    df = pd.DataFrame([dict(row) for row in rows])
     if not df.empty:
         df["tanggal"] = pd.to_datetime(df["tanggal"]).dt.date
         df["pendapatan"] = df["penjualan"] * df["harga_jual"]
         df["total_biaya"] = df["produksi"] * df["biaya_produksi"]
         df["keuntungan"] = df["pendapatan"] - df["total_biaya"]
     return df
-
 
 def save_data(
     user_id, tanggal, produksi, penjualan, sisa_ayam,
@@ -193,7 +224,7 @@ def save_data(
                 INSERT INTO data_harian
                 (user_id, tanggal, produksi, penjualan, sisa_ayam,
                  harga_jual, biaya_produksi)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     user_id, str(tanggal), produksi, penjualan, sisa_ayam,
@@ -204,9 +235,9 @@ def save_data(
             conn.execute(
                 """
                 UPDATE data_harian
-                SET tanggal=?, produksi=?, penjualan=?, sisa_ayam=?,
-                    harga_jual=?, biaya_produksi=?
-                WHERE id=? AND user_id=?
+                SET tanggal=%s, produksi=%s, penjualan=%s, sisa_ayam=%s,
+                    harga_jual=%s, biaya_produksi=%s
+                WHERE id=%s AND user_id=%s
                 """,
                 (
                     str(tanggal), produksi, penjualan, sisa_ayam,
@@ -219,84 +250,17 @@ def save_data(
 def delete_data(user_id, row_id):
     with get_connection() as conn:
         conn.execute(
-            "DELETE FROM data_harian WHERE id=? AND user_id=?",
+            "DELETE FROM data_harian WHERE id=%s AND user_id=%s",
             (int(row_id), user_id),
         )
         conn.commit()
 
 
 # =========================================================
-# MIGRASI DATA LAMA
+# DATA LAMA
 # =========================================================
-def legacy_data_available():
-    with get_connection() as conn:
-        if not table_exists(conn, "data_harian_legacy"):
-            return False
-        count = conn.execute(
-            "SELECT COUNT(*) AS jumlah FROM data_harian_legacy"
-        ).fetchone()["jumlah"]
-    return count > 0
-
-
-def import_legacy_data(user_id, import_code):
-    """
-    Data lama hanya dapat diimpor jika kode LEGACY_IMPORT_CODE
-    sudah disetel di Streamlit secrets.
-    """
-    try:
-        expected_code = st.secrets["LEGACY_IMPORT_CODE"]
-    except Exception:
-        expected_code = ""
-
-    if not expected_code or not hmac.compare_digest(
-        str(import_code), str(expected_code)
-    ):
-        return False, "Kode pemindahan data tidak sesuai atau belum dikonfigurasi."
-
-    with get_connection() as conn:
-        if not table_exists(conn, "data_harian_legacy"):
-            return False, "Data lama tidak ditemukan di database ini."
-
-        legacy_columns = {
-            row["name"]
-            for row in conn.execute(
-                "PRAGMA table_info(data_harian_legacy)"
-            ).fetchall()
-        }
-        required = {
-            "tanggal", "produksi", "penjualan", "sisa_ayam",
-            "harga_jual", "biaya_produksi",
-        }
-        if not required.issubset(legacy_columns):
-            return False, "Struktur tabel lama tidak sesuai."
-
-        rows = conn.execute(
-            """
-            SELECT tanggal, produksi, penjualan, sisa_ayam,
-                   harga_jual, biaya_produksi
-            FROM data_harian_legacy
-            """
-        ).fetchall()
-
-        imported = 0
-        for row in rows:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO data_harian
-                (user_id, tanggal, produksi, penjualan, sisa_ayam,
-                 harga_jual, biaya_produksi)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id, row["tanggal"], row["produksi"],
-                    row["penjualan"], row["sisa_ayam"],
-                    row["harga_jual"], row["biaya_produksi"],
-                ),
-            )
-            imported += 1
-        conn.commit()
-
-    return True, f"Proses impor selesai. {imported} catatan diperiksa."
+# Database SQLite lama tidak otomatis tersedia di Supabase.
+# Pemindahan data lama dilakukan terpisah setelah aplikasi online aktif.
 
 
 # =========================================================
@@ -486,7 +450,7 @@ if st.session_state.user_id is None:
                         st.success(
                             "Akun berhasil dibuat. Silakan masuk menggunakan akun baru."
                         )
-                    except sqlite3.IntegrityError:
+                    except psycopg2.IntegrityError:
                         st.error("Username sudah digunakan. Silakan pilih username lain.")
 
     st.stop()
@@ -499,6 +463,7 @@ user = get_user(st.session_state.user_id)
 if not user:
     st.session_state.user_id = None
     st.rerun()
+    st.stop()
 
 user_id = int(user["id"])
 df = load_data(user_id)
@@ -637,7 +602,7 @@ elif menu == "Input Data":
                     )
                     st.success("Data berhasil disimpan!")
                     st.rerun()
-                except sqlite3.IntegrityError:
+                except psycopg2.IntegrityError:
                     st.error("Data untuk tanggal tersebut sudah ada. Buka menu Riwayat untuk mengedit data.")
 
     st.caption("Satu tanggal hanya dapat memiliki satu catatan untuk setiap akun.")
@@ -889,7 +854,7 @@ elif menu == "Riwayat":
                                 )
                                 st.success("Data berhasil diperbarui.")
                                 st.rerun()
-                            except sqlite3.IntegrityError:
+                            except psycopg2.IntegrityError:
                                 st.error("Tanggal tersebut sudah memiliki data lain.")
 
             with st.expander("Hapus data terpilih"):
@@ -934,26 +899,12 @@ elif menu == "Profil Usaha":
             st.rerun()
 
     st.markdown("---")
-    st.subheader("Pemindahan Data dari Database Lama")
-    if legacy_data_available():
-        st.info(
-            "Terdapat data dari database versi lama. Untuk mencegah pengguna "
-            "lain mengambil data tersebut, proses impor memerlukan kode khusus "
-            "yang disetel oleh pengelola sebelum pemindahan."
-        )
-        import_code = st.text_input(
-            "Kode pemindahan data", type="password",
-            help="Kode ini harus disimpan sebagai LEGACY_IMPORT_CODE di Streamlit secrets."
-        )
-        if st.button("Impor data lama ke akun ini", type="primary"):
-            ok, message = import_legacy_data(user_id, import_code)
-            if ok:
-                st.success(message)
-                st.rerun()
-            else:
-                st.error(message)
-    else:
-        st.caption("Tidak ditemukan tabel data lama pada database yang sedang digunakan.")
+    st.info(
+        "Database aplikasi ini sudah menggunakan PostgreSQL online. "
+        "Data dari database SQLite versi lokal tidak otomatis ikut berpindah. "
+        "Simpan file database lama sebagai cadangan; pemindahan data lama "
+        "akan dilakukan melalui proses migrasi terpisah."
+    )
 
     st.markdown("---")
     st.caption("SI-PRO IKM · Sistem Pendukung Keputusan Produksi")
